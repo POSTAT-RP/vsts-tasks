@@ -6,7 +6,7 @@ import fs = require('fs');
 
 import { ToolRunner } from 'vsts-task-lib/toolrunner';
 
-var utils = require('./utils.js');
+import utils = require('./utils');
 
 class UploadInfo {
     upload_id: string;
@@ -164,37 +164,41 @@ function publishRelease(apiServer: string, releaseUrl: string, releaseNotes: str
 
 /**
  * If the input is a single file, upload this file without any processing.
- * If the input is a dSYM folder, zip the parent and upload the zip so dSYM folder appears on the root of the archive
- * If the input is a folder, zip the input folder so all files under this folder appears on the root of the archive 
+ * If the input is a single folder, zip it's content. The archive name is the folder's name
+ * If the input is a set of folders, zip the folders so they appear on the root of the archive. The archive name is the parent folder's name.
  */
-function prepareSymbols(symbolsPath: string, packParentFolder: boolean): Q.Promise<string> {
-    tl.debug("-- Prepare symbols")
-    let defer = Q.defer<string>();
+function prepareSymbols(symbolsPaths: string[], symbolsRoot: string): Q.Promise<string> { 
+    tl.debug("-- Prepare symbols");
+    let defer = Q.defer<string>(); 
 
-    let stat = fs.statSync(symbolsPath);
-    if (stat.isFile() && !packParentFolder) {
-        // single file - Android source mapping txt file
-        tl.debug(`---- symbol file: ${symbolsPath}`)
-        defer.resolve(symbolsPath);
-    } else {
-        if (packParentFolder) {
-            tl.debug(`---- Take the parent folder of ${symbolsPath}`);
-            symbolsPath = path.dirname(symbolsPath);
-        }
+    let zipFileName: string = null;
+    if (symbolsPaths.length === 1 && fs.statSync(symbolsPaths[0]).isFile()) {
+        // single file - Android source mapping txt file 
+        tl.debug(`---- symbol file: ${symbolsPaths[0]}`) 
+        defer.resolve(symbolsPaths[0]); 
+    } else { 
+        tl.debug(`---- Archiving ${symbolsPaths}`); 
+        
+        // If symbol paths do not have anything common, e.g /a/b/c and /x/y/z,
+        // let's use some default name for the archive.
+        let zipName = symbolsRoot ? path.basename(symbolsRoot) : "symbols";
+        tl.debug(`---- Zip file name=${zipName}`); 
 
-        tl.debug(`---- Creating symbols from ${symbolsPath}`);
-        let zipStream = utils.createZipStream(symbolsPath, utils.isDsym(symbolsPath));
         let workDir = tl.getVariable("System.DefaultWorkingDirectory");
-        let zipName = path.join(workDir, `${path.basename(symbolsPath)}.zip`);
-        utils.createZipFile(zipStream, zipName).
-            then(() => {
-                tl.debug(`---- symbol file: ${zipName}`)
-                defer.resolve(zipName);
-            });
-    }
+        let zipPath = path.join(workDir, `${zipName}.zip`); 
+        tl.debug(`---- Zip file path=${zipPath}`); 
 
-    return defer.promise;
-}
+        let zipStream = utils.createZipStream(symbolsPaths, symbolsRoot); 
+        utils.createZipFile(zipStream, zipPath). 
+            then(() => { 
+                tl.debug(`---- symbol file: ${zipPath}`) 
+                defer.resolve(zipPath); 
+            }); 
+    } 
+
+
+    return defer.promise; 
+} 
 
 function beginSymbolUpload(apiServer: string, apiVersion: string, appSlug: string, symbol_type: string, token: string, userAgent: string): Q.Promise<SymbolsUploadInfo> {
     tl.debug("-- Begin symbols upload")
@@ -268,6 +272,42 @@ function commitSymbols(apiServer: string, apiVersion: string, appSlug: string, s
     return defer.promise;
 }
 
+function expandSymbolsPaths(symbolsType: string, pattern: string, continueOnError: boolean, packParentFolder: boolean): string[] {
+    tl.debug("-- Expanding symbols path pattern to a list of paths");
+    
+    let symbolsPaths: string[] = [];
+
+    if (symbolsType === "Apple") {
+        // User can specifay a symbols path pattern that selects 
+        // multiple dSYM folder paths for Apple application.
+        let dsymPaths = utils.resolvePaths(pattern, continueOnError, packParentFolder);
+
+        dsymPaths.forEach(dsymFolder => {
+            if (dsymFolder) {
+                let folderPath = utils.checkAndFixFilePath(dsymFolder, "symbolsPath", continueOnError);
+                // The path can be null if continueIfSymbolsNotFound is true and the folder does not exist.
+                if (folderPath) {
+                    symbolsPaths.push(folderPath);
+                }
+            }
+        })
+    } else {
+        // For all other application types user can specifay a symbols path pattern 
+        // that selects only one file or one folder.
+        let symbolsFile = utils.resolveSinglePath(pattern, continueOnError, packParentFolder);
+
+        if (symbolsFile) {
+            let filePath = utils.checkAndFixFilePath(symbolsFile, "symbolsPath", continueOnError);
+            // The path can be null if continueIfSymbolsNotFound is true and the file/folder does not exist.
+            if (filePath) {
+                symbolsPaths.push(filePath);
+            }
+        }
+    }
+
+    return symbolsPaths;
+}
+
 async function run() {
     try {
         tl.setResourcePath(path.join(__dirname, 'task.json'));
@@ -331,7 +371,9 @@ async function run() {
         if (continueIfSymbolsNotFoundVariable && continueIfSymbolsNotFoundVariable.toLowerCase() === 'true') {
             continueIfSymbolsNotFound = true;
         }
-        let symbolsPath = utils.checkAndFixFilePath(utils.resolveSinglePath(symbolsPathPattern, continueIfSymbolsNotFound), "symbolsPath", continueIfSymbolsNotFound);
+
+        // Expand symbols path pattern to a list of paths
+        let symbolsPaths = expandSymbolsPaths(symbolsType, symbolsPathPattern, continueIfSymbolsNotFound, packParentFolder);
 
         // Begin release upload
         let uploadInfo: UploadInfo = await beginReleaseUpload(effectiveApiServer, effectiveApiVersion, appSlug, apiToken, userAgent);
@@ -346,9 +388,12 @@ async function run() {
         await publishRelease(effectiveApiServer, packageUrl, releaseNotes, distributionGroupId, apiToken, userAgent);
 
         // Uploading symbols
-        if (symbolsPath) {
+        if (symbolsPaths.length > 0) {
+            // Detect the common parent of all symbols paths to define the archive's internal folder structure.
+            let symbolsRoot = utils.findCommonParent(symbolsPaths);
+
             // Prepare symbols 
-            let symbolsFile = await prepareSymbols(symbolsPath, packParentFolder);
+            let symbolsFile = await prepareSymbols(symbolsPaths, symbolsRoot);
 
             // Begin preparing upload symbols
             let symbolsUploadInfo = await beginSymbolUpload(effectiveApiServer, effectiveApiVersion, appSlug, symbolsType, apiToken, userAgent);
